@@ -2,7 +2,7 @@
 
 from crewai import Agent, Task, Crew, Process, LLM
 
-from search_tool import web_search
+from search_tool import web_search, read_webpage
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -14,6 +14,10 @@ MODEL_CANDIDATES = [
     "openai/openai/gpt-oss-120b",
     "openai/gpt-oss-120b",
 ]
+
+# gpt-oss sometimes tries to call a tool that doesn't exist (e.g. "open_file")
+# and Groq rejects it. The mistake is random, so we simply retry.
+MAX_TOOL_RETRIES = 3
 
 
 def build_llm(model_name: str, api_key: str) -> LLM:
@@ -32,19 +36,25 @@ def build_crew(llm: LLM) -> Crew:
         goal="Research the topic '{topic}' on the web and write an accurate, well-structured report.",
         backstory=(
             "You are a careful research analyst. You search the web, compare "
-            "several sources, avoid guessing, and always list your sources."
+            "several sources, avoid guessing, and always list your sources. "
+            "You can ONLY use the tools you were given: 'DuckDuckGo Search' and "
+            "'Read Webpage'. You never call any other tool."
         ),
-        tools=[web_search],
+        tools=[web_search, read_webpage],
         llm=llm,
         allow_delegation=False,
-        max_iter=8,        # limits how many think/search loops the agent may do
+        max_iter=12,       # limits how many think/search loops the agent may do
         verbose=False,
     )
 
     task = Task(
         description=(
             "Research the topic: {topic}\n\n"
-            "Use the DuckDuckGo Search tool 3 to 5 times with different queries. "
+            "Step 1: Use the 'DuckDuckGo Search' tool 3 to 5 times with different queries.\n"
+            "Step 2: Optionally use the 'Read Webpage' tool (with a URL from the search "
+            "results) on 1 or 2 of the best pages. PDF links can't be read, so skip them.\n"
+            "Only use these two tools. Never call any other tool such as open_file, "
+            "browser or python.\n"
             "Base your report only on what you found. If sources disagree or "
             "information is missing, say so."
         ),
@@ -71,17 +81,25 @@ def build_crew(llm: LLM) -> Crew:
 def run_research(topic: str, api_key: str) -> str:
     """Runs the agent and returns the report as Markdown text."""
     last_error = None
-    for i, model_name in enumerate(MODEL_CANDIDATES):
-        try:
-            crew = build_crew(build_llm(model_name, api_key))
-            result = crew.kickoff(inputs={"topic": topic})
-            return getattr(result, "raw", str(result))
-        except Exception as e:
-            last_error = e
-            msg = str(e).lower()
-            is_model_problem = any(k in msg for k in ("model", "404", "not found"))
-            is_last = i == len(MODEL_CANDIDATES) - 1
-            if is_model_problem and not is_last:
-                continue  # try the next model-name format
-            raise
+    for model_name in MODEL_CANDIDATES:
+        for attempt in range(MAX_TOOL_RETRIES + 1):
+            try:
+                crew = build_crew(build_llm(model_name, api_key))
+                result = crew.kickoff(inputs={"topic": topic})
+                return getattr(result, "raw", str(result))
+            except Exception as e:
+                last_error = e
+                msg = str(e).lower()
+
+                # 1) Model called a tool that doesn't exist -> just try again.
+                if ("tool_use_failed" in msg or "tool call validation failed" in msg) \
+                        and attempt < MAX_TOOL_RETRIES:
+                    continue
+
+                # 2) Wrong model-name format -> try the next candidate name.
+                if any(k in msg for k in ("model", "404", "not found")):
+                    break
+
+                # 3) Anything else (bad key, rate limit...) -> show the error.
+                raise
     raise last_error
