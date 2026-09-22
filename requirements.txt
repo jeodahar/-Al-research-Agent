@@ -3,3 +3,5 @@ ddgs
 streamlit>=1.40.0
 requests
 beautifulsoup4
+markdown
+xhtml2pdf
